@@ -9,6 +9,7 @@ use postgres_protocol::message::backend::{
 };
 use std::{
     collections::BTreeMap,
+    env,
     str::FromStr,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -53,11 +54,15 @@ fn parse_single_row<T: FromStr>(
 
 #[tokio::main]
 async fn main() -> Result<(), ReplicationError> {
-    let mut replication_lsn = PgLsn::from(23525992);
+    let args: Vec<String> = env::args().collect();
+    let mut replication_lsn = if args.len() > 2 {
+        PgLsn::from_str(&args[2]).unwrap()
+    } else {
+        PgLsn::from(0)
+    };
 
-    let pg_config = tokio_postgres::Config::from_str(
-        "host=127.0.0.1 port=5433 user=postgres password=password dbname=testdb",
-    )?;
+    //"host=127.0.0.1 port=5433 user=postgres password=password dbname=testdb",
+    let pg_config = tokio_postgres::Config::from_str(&args[1])?;
 
     let tunnel_config = mz_postgres_util::TunnelConfig::Direct;
     let connection_config = Config::new(pg_config, tunnel_config)?;
@@ -67,6 +72,8 @@ async fn main() -> Result<(), ReplicationError> {
     let source_id = "source_id";
 
     if replication_lsn == PgLsn::from(0) {
+        println!("======== BEGIN SNAPSHOT ==========");
+
         let publication_tables =
             mz_postgres_util::publication_info(&connection_config, publication, None).await?;
 
@@ -157,7 +164,6 @@ async fn main() -> Result<(), ReplicationError> {
 
             dbg!(output, row, slot_lsn, 1);
         }
-
         println!("======== END SNAPSHOT ==========");
 
         if let Some(temp_slot) = temp_slot {
@@ -373,7 +379,7 @@ async fn produce_replication<'a>(
         // Scratch space to use while evaluating casts
         // let mut datum_vec = DatumVec::new();
 
-        let last_commit_lsn = as_of;
+        let mut last_commit_lsn = as_of;
         // let mut observed_wal_end = as_of;
         // The outer loop alternates the client between streaming the replication slot and using
         // normal SQL queries with pg admin functions to fast-foward our cursor in the event of WAL
@@ -414,7 +420,22 @@ async fn produce_replication<'a>(
                 match stream.as_mut().next().await {
                     Some(Ok(ReplicationMessage::XLogData(xlog_data))) => {
                         last_data_message = Instant::now();
-                        yield xlog_data;
+                        match xlog_data.data() {
+                            LogicalReplicationMessage::Commit(commit) => {
+                                // metrics.transactions.inc();
+                                last_commit_lsn = PgLsn::from(commit.end_lsn());
+
+                                // for (output, row) in deletes.drain(..) {
+                                //     yield Event::Message(last_commit_lsn, (output, row, -1));
+                                // }
+                                // for (output, row) in inserts.drain(..) {
+                                //     yield Event::Message(last_commit_lsn, (output, row, 1));
+                                // }
+                                // yield Event::Progress([PgLsn::from(u64::from(last_commit_lsn) + 1)]);
+                                // metrics.lsn.set(last_commit_lsn.into());
+                            }
+                            _ => yield xlog_data,
+                        }
                     }
                     // Some(Ok(XLogData(xlog_data))) => match xlog_data.data() {
                     //     Begin(_) => {
@@ -650,6 +671,7 @@ async fn produce_replication<'a>(
                         return Err(ReplicationError::from(err))?;
                     }
                     None => {
+                        dbg!("eof");
                         break;
                     }
                     // The enum is marked non_exhaustive, better be conservative
